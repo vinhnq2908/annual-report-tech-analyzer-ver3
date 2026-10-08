@@ -228,11 +228,23 @@ def extract_pages(pdf: bytes) -> tuple[int, list[dict]]:
     return len(reader.pages), pages
 
 
+LEVELS = {
+    0: "0 - Không có bằng chứng áp dụng",
+    1: "1 - Chỉ đề cập",
+    2: "2 - Có kế hoạch/dự kiến",
+    3: "3 - Đang triển khai/áp dụng",
+    4: "4 - Đã áp dụng/đang vận hành",
+}
+MIN_EVIDENCE = 3
+
+
 def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, context_terms,
-                      action_terms, operational_terms, planned_terms, negative_terms) -> dict:
+                      action_terms, operational_terms, planned_terms, negative_terms,
+                      min_evidence=MIN_EVIDENCE) -> dict:
     raw_erp = raw_tech = relevant_erp = relevant_tech = context_hits = 0
-    action_hits = operational_hits = planned_hits = negative_hits = word_count = best_score = 0
-    relevant_terms, evidence = set(), []
+    action_hits = operational_hits = planned_hits = negative_hits = word_count = 0
+    s1 = s2 = s3 = s4 = points = best_score = 0
+    relevant_terms, evidence, stuck = set(), [], []
     for page in pages:
         word_count += len(page["text"].split())
         raw_erp += count_matches(page["normalized"], erp_terms)
@@ -245,13 +257,17 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
             context = find_matches(normalized, context_terms)
             if not erp and not tech:
                 continue
+            s1 += 1
             is_erp_relevant = bool(erp and context)
             is_tech_relevant = bool(tech and (context or any(
                 any(marker in normalize_text(term) for marker in ACCOUNTING_SPECIFIC_MARKERS)
                 for _, _, term in tech
             )))
             if not (is_erp_relevant or is_tech_relevant):
+                labels = "; ".join(term for _, _, term in erp + tech)
+                stuck.append(f"Kẹt sàng 2 (thiếu ngữ cảnh kế toán) | Trang {page['page']} | {labels} | {unit[:500]}")
                 continue
+            s2 += 1
             relevant = (erp if is_erp_relevant else []) + (tech if is_tech_relevant else [])
             relevant_terms.update(term for _, _, term in relevant)
             relevant_erp += len(erp) if is_erp_relevant else 0
@@ -268,23 +284,54 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
             if negative:
                 status, score = "Phủ định/không áp dụng", 0
             elif operational:
-                status, score = "Đã áp dụng/đang vận hành", 4
+                status, score = LEVELS[4], 4
             elif actions:
-                status, score = "Đang triển khai/áp dụng", 3
+                status, score = LEVELS[3], 3
             elif planned:
-                status, score = "Có kế hoạch/dự kiến", 2
+                status, score = LEVELS[2], 2
             else:
-                status, score = "Chỉ đề cập", 1
+                status, score = LEVELS[1], 1
+            s3 += score >= 2
+            s4 += score == 4
+            points += score
             best_score = max(best_score, score)
             labels = "; ".join(term for _, _, term in relevant)
             evidence.append(f"Trang {page['page']} | {status} | {labels} | {unit[:700]}")
-    statuses = {
-        0: "Không có bằng chứng liên quan", 1: "Chỉ đề cập",
-        2: "Có kế hoạch/dự kiến", 3: "Đang triển khai/áp dụng",
-        4: "Đã áp dụng/đang vận hành",
-    }
+            if score <= 1:
+                stuck.append(f"Kẹt sàng 3 ({status}) | Trang {page['page']} | {labels} | {unit[:500]}")
+
+    if s1 == 0:
+        stuck_stage = "Sàng 1: không có từ khóa ERP/công nghệ"
+    elif s2 == 0:
+        stuck_stage = "Sàng 2: có từ khóa nhưng không có ngữ cảnh kế toán"
+    elif s3 == 0:
+        stuck_stage = "Sàng 3: có ngữ cảnh kế toán nhưng chưa có hành động/kế hoạch"
+    elif s4 == 0:
+        stuck_stage = "Sàng 4: có triển khai/kế hoạch nhưng chưa có bằng chứng đã vận hành"
+    else:
+        stuck_stage = "Qua đủ 4 sàng"
+
+    if not evidence:
+        evidence_status = "Không có bằng chứng"
+    elif len(evidence) < min_evidence:
+        evidence_status = "Ít bằng chứng"
+    else:
+        evidence_status = "Đủ bằng chứng"
+
+    stuck_evidence = "\n".join(stuck[:15])
+    if evidence_status != "Đủ bằng chứng" and not stuck_evidence:
+        stuck_evidence = f"{stuck_stage} | báo cáo không có câu nào để hiển thị"
+    if evidence_status == "Đủ bằng chứng":
+        stuck_evidence = ""
+
     return {
         "document": name, "url": url, "pages": pages_count, "word_count": word_count,
+        "adoption_level": best_score, "adoption_level_name": LEVELS[best_score],
+        "adoption_points": points,
+        "evidence_status": evidence_status, "evidence_count": len(evidence),
+        "stuck_stage": stuck_stage,
+        "stage1_keyword_sentences": s1, "stage2_accounting_sentences": s2,
+        "stage3_action_or_plan_sentences": s3, "stage4_operational_sentences": s4,
         "erp_frequency": raw_erp, "erp_accounting_frequency": relevant_erp,
         "accounting_tech_frequency": raw_tech,
         "accounting_tech_relevant_frequency": relevant_tech,
@@ -292,10 +339,17 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
         "technology_diversity": len(relevant_terms), "accounting_context_hits": context_hits,
         "action_word_hits": action_hits, "operational_evidence_hits": operational_hits,
         "planned_evidence_hits": planned_hits, "negative_evidence_hits": negative_hits,
-        "adoption_score": best_score, "adoption_status": statuses[best_score],
-        "tech_adoption": int(best_score >= 3), "relevant_terms": "; ".join(sorted(relevant_terms)),
+        "relevant_terms": "; ".join(sorted(relevant_terms)),
         "evidence": "\n".join(evidence[:20]),
+        "stuck_evidence": stuck_evidence,
     }
+
+
+def rank_rows(rows: list[dict]) -> None:
+    keys = sorted({(r["adoption_level"], r["adoption_points"]) for r in rows}, reverse=True)
+    for row in rows:
+        row["adoption_rank"] = keys.index((row["adoption_level"], row["adoption_points"])) + 1
+    rows.sort(key=lambda r: r["adoption_rank"])
 
 
 def main() -> None:
@@ -346,6 +400,7 @@ def main() -> None:
                 progress.progress(index / len(urls))
 
             if rows:
+                rank_rows(rows)
                 st.subheader("Kết quả")
                 st.dataframe(rows, use_container_width=True)
                 output = io.StringIO()
