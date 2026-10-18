@@ -259,7 +259,7 @@ LEVELS = {
     3: "3 - Đang triển khai/áp dụng",
     4: "4 - Đã áp dụng/đang vận hành",
 }
-MIN_EVIDENCE = 2
+MIN_EVIDENCE = 3
 
 
 def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, context_terms,
