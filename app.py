@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 import ipaddress
 import json
 import re
@@ -226,12 +227,24 @@ def count_matches(text: str, terms: list[str]) -> int:
 
 
 def ocr_tessdata() -> str:
-    for folder in (
+    # ponytail: search project folders first, then venv/system prefixes, upgrade if custom tesseract config needed.
+    candidates = (
         Path(__file__).resolve().parent / "tessdata",
+        Path(__file__).resolve().parent / ".venv" / "share" / "tessdata",
+        Path.cwd() / "tessdata",
+        Path(__file__).resolve().parent.parent / "tessdata",
+        Path(__file__).resolve().parent.parent.parent / "tessdata",
         Path(sys.prefix) / "share" / "tessdata",
-    ):
-        if all((folder / f"{lang}.traineddata").is_file() for lang in ("vie", "eng")):
-            return str(folder)
+        Path(os.environ.get("TESSDATA_PREFIX", "")),
+        Path("C:/Program Files/Tesseract-OCR/tessdata"),
+        Path("C:/Program Files (x86)/Tesseract-OCR/tessdata"),
+    )
+    for folder in candidates:
+        try:
+            if folder and folder.is_dir() and all((folder / f"{lang}.traineddata").is_file() for lang in ("vie", "eng")):
+                return str(folder)
+        except Exception:
+            pass
     try:
         folder = Path(pymupdf.get_tessdata())
         if all((folder / f"{lang}.traineddata").is_file() for lang in ("vie", "eng")):
