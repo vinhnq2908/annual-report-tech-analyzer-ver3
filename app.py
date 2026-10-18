@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 import streamlit as st
 import pymupdf
 
-REPORT_TIMEOUT_SECONDS = 300
+REPORT_TIMEOUT_SECONDS = 900
 OCR_DPI = 150
 MAX_OCR_PIXELS = 12_000_000
 
