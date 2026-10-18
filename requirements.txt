@@ -1,2 +1,2 @@
 streamlit>=1.38,<2
-pypdf>=5,<7
+PyMuPDF>=1.26,<2
