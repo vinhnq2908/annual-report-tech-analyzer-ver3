@@ -219,12 +219,39 @@ def count_matches(text: str, terms: list[str]) -> int:
 def extract_pages(pdf: bytes) -> tuple[int, list[dict]]:
     reader = PdfReader(io.BytesIO(pdf))
     pages = []
+    skipped_pages = []
+
     for number, page in enumerate(reader.pages, start=1):
-        raw = page.extract_text() or ""
+        try:
+            raw = page.extract_text() or ""
+        except Exception as exc:
+            if "maximum number of tokens per stream" not in str(exc).lower():
+                raise
+            skipped_pages.append(number)
+            continue
+
         text = clean_pdf_text(re.sub(r"-\s*\n\s*", "", raw))
         text = " ".join(text.split())
+
         if text:
-            pages.append({"page": number, "text": text, "normalized": normalize_text(text)})
+            pages.append({
+                "page": number,
+                "text": text,
+                "normalized": normalize_text(text),
+            })
+
+    if not pages:
+        raise ValueError(
+            "Không trích được chữ từ báo cáo. Cần đọc bằng công cụ khác hoặc OCR."
+        )
+
+    if skipped_pages:
+        raise ValueError(
+            "Báo cáo đọc không đầy đủ do lỗi token stream tại trang PDF: "
+            + ", ".join(map(str, skipped_pages))
+            + ". Không chấm TECH để tránh kết quả sai do thiếu dữ liệu."
+        )
+
     return len(reader.pages), pages
 
 
