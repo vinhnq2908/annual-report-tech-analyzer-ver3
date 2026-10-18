@@ -13,7 +13,11 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import streamlit as st
-from pypdf import PdfReader
+import pymupdf
+
+REPORT_TIMEOUT_SECONDS = 300
+OCR_DPI = 150
+MAX_OCR_PIXELS = 12_000_000
 
 DEFAULT_ERP_TERMS = """ERP
 hệ thống ERP
@@ -221,25 +225,85 @@ def count_matches(text: str, terms: list[str]) -> int:
     return len(find_matches(text, terms))
 
 
+def ocr_tessdata() -> str:
+    for folder in (
+        Path(__file__).resolve().parent / "tessdata",
+        Path(sys.prefix) / "share" / "tessdata",
+    ):
+        if all((folder / f"{lang}.traineddata").is_file() for lang in ("vie", "eng")):
+            return str(folder)
+    try:
+        folder = Path(pymupdf.get_tessdata())
+        if all((folder / f"{lang}.traineddata").is_file() for lang in ("vie", "eng")):
+            return str(folder)
+    except Exception:
+        pass
+    raise RuntimeError(
+        "OCR thiếu vie.traineddata hoặc eng.traineddata. "
+        "Đặt cả hai trong thư mục tessdata cạnh app.py, "
+        "hoặc cài ngôn ngữ Tesseract theo README.md."
+    )
+
 def extract_pages(pdf: bytes) -> tuple[int, list[dict], list[dict]]:
-    reader = PdfReader(io.BytesIO(pdf))
     pages, skipped = [], []
-    page_count = len(reader.pages)
-    for number in range(1, page_count + 1):
-        # Page errors are recoverable; the parent process enforces the report timeout.
-        try:
-            raw = reader.pages[number - 1].extract_text() or ""
-        except Exception as exc:
-            skipped.append({"page": number, "reason": f"{type(exc).__name__}: {exc}"})
-            continue
-        text = clean_pdf_text(re.sub(r"-\s*\n\s*", "", raw))
-        text = " ".join(text.split())
-        if text:
-            pages.append({"page": number, "text": text, "normalized": normalize_text(text)})
+    tessdata, ocr_setup_error = None, ""
+    with pymupdf.open(stream=pdf, filetype="pdf") as document:
+        if document.needs_pass:
+            raise ValueError("PDF có mật khẩu; cần bản không khóa để phân tích.")
+        page_count = len(document)
+        for index in range(page_count):
+            page, text, reason, method = None, "", "", "text"
+            try:
+                page = document.load_page(index)
+                raw = page.get_text(
+                    "text", sort=True,
+                    flags=pymupdf.TEXTFLAGS_TEXT & ~pymupdf.TEXT_USE_CID_FOR_UNKNOWN_UNICODE,
+                )
+                text = " ".join(clean_pdf_text(re.sub(r"-\s*\n\s*", "", raw)).split())
+            except Exception as exc:
+                reason = f"Đọc text lỗi: {type(exc).__name__}: {exc}"
+
+            # ponytail: OCR only low-text/garbled pages; extend for mixed image/text pages if needed.
+            if sum(char.isalnum() for char in text) < 20 or text.count("\ufffd") > len(text) * 0.02:
+                try:
+                    if page is None:
+                        raise ValueError("Không mở được trang để OCR.")
+                    if page.rect.width * page.rect.height * (OCR_DPI / 72) ** 2 > MAX_OCR_PIXELS:
+                        raise ValueError("Trang quá lớn để OCR an toàn ở 150 DPI (quá 12 triệu pixel).")
+                    if tessdata is None and not ocr_setup_error:
+                        try:
+                            tessdata = ocr_tessdata()
+                        except Exception as exc:
+                            ocr_setup_error = str(exc)
+                    if ocr_setup_error:
+                        raise RuntimeError(ocr_setup_error)
+                    textpage = page.get_textpage_ocr(
+                        language="vie+eng", dpi=OCR_DPI, full=True, tessdata=tessdata,
+                    )
+                    raw = page.get_text("text", textpage=textpage, sort=True)
+                    ocr_text = " ".join(clean_pdf_text(re.sub(r"-\s*\n\s*", "", raw)).split())
+                    if not ocr_text:
+                        raise ValueError("Không thấy chữ sau OCR; trang có thể trống hoặc không đọc được.")
+                    if len(ocr_text) >= len(text) or "\ufffd" in text:
+                        text, method = ocr_text, "ocr"
+                    reason = ""
+                except Exception as exc:
+                    reason = "; ".join(filter(None, (reason, f"OCR lỗi: {type(exc).__name__}: {exc}")))
+
+            if text and text.count("\ufffd") > len(text) * 0.02:
+                reason = "; ".join(filter(None, (reason, "Text còn quá nhiều ký tự không đọc được.")))
+                text = ""
+            if text:
+                pages.append({
+                    "page": index + 1, "text": text,
+                    "normalized": normalize_text(text), "method": method,
+                })
+            if reason:
+                skipped.append({"page": index + 1, "reason": reason, "retained_text": bool(text)})
     if not pages:
         raise ValueError(
             "Không đọc được trang có chữ; không chấm mức áp dụng. "
-            + "; ".join(f"Trang {item['page']}: {item['reason']}" for item in skipped)
+            + "; ".join(f"Trang {item['page']}: {item['reason']}" for item in skipped[:10])
         )
     return page_count, pages, skipped
 
@@ -299,12 +363,12 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
             negative_hits += negative
             if negative:
                 status, score = "Phủ định/không áp dụng", 0
+            elif planned:
+                status, score = LEVELS[2], 2
             elif operational:
                 status, score = LEVELS[4], 4
             elif actions:
                 status, score = LEVELS[3], 3
-            elif planned:
-                status, score = LEVELS[2], 2
             else:
                 status, score = LEVELS[1], 1
             s3 += score >= 2
@@ -372,17 +436,24 @@ def report_worker(request_path: str, result_path: str) -> None:
     try:
         request = json.loads(Path(request_path).read_text(encoding="utf-8"))
         url = public_url(request["url"])
-        page_count, pages, skipped = extract_pages(download_pdf(url))
+        page_count, pages, issues = extract_pages(download_pdf(url))
+        skipped = [item for item in issues if not item["retained_text"]]
+        ocr_pages = [str(page["page"]) for page in pages if page["method"] == "ocr"]
         row = classify_evidence(
             url.rsplit("/", 1)[-1] or url, url, page_count, pages, *request["groups"],
         )
         row.update({
-            "extraction_status": "partial" if skipped else "completed",
+            "extraction_status": "partial" if issues else "completed",
             "pages_with_text": len(pages),
+            "ocr_page_count": len(ocr_pages),
+            "ocr_pages": "; ".join(ocr_pages),
+            "incomplete_page_count": len(issues),
             "skipped_page_count": len(skipped),
             "skipped_pages": "; ".join(str(item["page"]) for item in skipped),
             "extraction_errors": "\n".join(
-                f"Trang {item['page']}: {item['reason']}" for item in skipped
+                f"Trang {item['page']}: {item['reason']}"
+                + (" (giữ phần text đọc được)" if item["retained_text"] else "")
+                for item in issues
             ),
         })
     except Exception as exc:
@@ -390,7 +461,7 @@ def report_worker(request_path: str, result_path: str) -> None:
     Path(result_path).write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
 
 
-def run_report(url: str, groups: list[list[str]], timeout_seconds: float = 120) -> dict:
+def run_report(url: str, groups: list[list[str]], timeout_seconds: float = REPORT_TIMEOUT_SECONDS) -> dict:
     with TemporaryDirectory(prefix="annual-report-") as folder:
         request_path = Path(folder) / "request.json"
         result_path = Path(folder) / "result.json"
@@ -423,6 +494,10 @@ def main() -> None:
     st.set_page_config(page_title="ERP và Công nghệ Kế toán", layout="wide")
     st.title("Phân tích ERP và công nghệ trong kế toán")
     st.caption("Đếm từ khóa theo ngữ cảnh câu, chấm mức áp dụng, giữ số trang PDF và xuất CSV.")
+    st.caption(
+        f"Đọc text trước; OCR tiếng Việt/Anh khi trang có ít chữ hoặc lỗi ký tự. "
+        f"Tối đa {REPORT_TIMEOUT_SECONDS} giây/file, gồm tải và phân tích; xử lý tuần tự."
+    )
 
     with st.sidebar:
         st.header("Bộ từ khóa")
@@ -454,17 +529,22 @@ def main() -> None:
             progress = st.progress(0)
             current = st.empty()
             for index, raw_url in enumerate(urls, start=1):
-                current.info(f"Đang xử lý {index}/{len(urls)} — tối đa 120 giây/file: {raw_url}")
+                current.info(
+                    f"Đang xử lý {index}/{len(urls)} — "
+                    f"tối đa {REPORT_TIMEOUT_SECONDS} giây/file: {raw_url}"
+                )
                 try:
                     row = run_report(raw_url, groups)
                     rows.append(row)
-                    if row["skipped_page_count"]:
+                    if row["extraction_status"] == "partial":
                         st.warning(
-                            f"{row['document']}: bỏ qua trang PDF {row['skipped_pages']}. "
-                            "Kết quả chấm mức áp dụng tạm thời, chỉ dựa trên phần đọc được."
+                            f"{row['document']}: {row['incomplete_page_count']} trang chưa đọc đầy đủ, "
+                            f"bỏ qua {row['skipped_page_count']} trang "
+                            f"({row['skipped_pages'] or 'không có'}). "
+                            "Điểm tạm thời chỉ dựa trên phần đọc được; xem extraction_errors."
                         )
                     else:
-                        st.success(f"Đã phân tích: {row['document']}")
+                        st.success(f"Đã phân tích: {row['document']} — OCR {row['ocr_page_count']} trang.")
                 except Exception as exc:
                     failures.append({
                         "url": raw_url,
