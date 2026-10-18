@@ -411,7 +411,7 @@ def main() -> None:
             for index, raw_url in enumerate(urls, start=1):
                 try:
                     url = public_url(raw_url)
-                    page_count, pages = extract_pages(download_pdf(url))
+                    page_count, pages, skipped = extract_pages(download_pdf(url))
                     row = classify_evidence(
                         url.rsplit("/", 1)[-1] or url, url, page_count, pages,
                         erp_terms, tech_terms, context_terms, action_terms,
