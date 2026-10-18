@@ -1,9 +1,14 @@
 import csv
 import io
 import ipaddress
+import json
 import re
 import socket
+import subprocess
+import sys
 import unicodedata
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -162,9 +167,9 @@ def download_pdf(url: str) -> bytes:
     request = Request(url, headers={"User-Agent": "AnnualReportTechAnalyzer/1.0"})
     with urlopen(request, timeout=30) as response:
         content_type = (response.headers.get("Content-Type") or "").lower()
-        data = response.read(150 * 1024 * 1024 + 1)
-    if len(data) > 150 * 1024 * 1024:
-        raise ValueError("PDF vượt giới hạn 150 MB")
+        data = response.read(100 * 1024 * 1024 + 1)
+    if len(data) > 100 * 1024 * 1024:
+        raise ValueError("PDF vượt giới hạn 100 MB")
     if "pdf" not in content_type and not data.startswith(b"%PDF"):
         raise ValueError("URL không trả về file PDF")
     return data
@@ -220,37 +225,24 @@ def extract_pages(pdf: bytes) -> tuple[int, list[dict], list[dict]]:
     reader = PdfReader(io.BytesIO(pdf))
     pages, skipped = [], []
     page_count = len(reader.pages)
-
     for number in range(1, page_count + 1):
+        # Page errors are recoverable; the parent process enforces the report timeout.
         try:
             raw = reader.pages[number - 1].extract_text() or ""
         except Exception as exc:
-            skipped.append({
-                "page": number,
-                "reason": f"{type(exc).__name__}: {exc}",
-            })
+            skipped.append({"page": number, "reason": f"{type(exc).__name__}: {exc}"})
             continue
-
         text = clean_pdf_text(re.sub(r"-\s*\n\s*", "", raw))
         text = " ".join(text.split())
-
         if text:
-            pages.append({
-                "page": number,
-                "text": text,
-                "normalized": normalize_text(text),
-            })
-
+            pages.append({"page": number, "text": text, "normalized": normalize_text(text)})
     if not pages:
         raise ValueError(
             "Không đọc được trang có chữ; không chấm mức áp dụng. "
-            + "; ".join(
-                f"Trang {item['page']}: {item['reason']}"
-                for item in skipped
-            )
+            + "; ".join(f"Trang {item['page']}: {item['reason']}" for item in skipped)
         )
-
     return page_count, pages, skipped
+
 
 LEVELS = {
     0: "0 - Không có bằng chứng áp dụng",
@@ -376,6 +368,57 @@ def rank_rows(rows: list[dict]) -> None:
     rows.sort(key=lambda r: r["adoption_rank"])
 
 
+def report_worker(request_path: str, result_path: str) -> None:
+    try:
+        request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+        url = public_url(request["url"])
+        page_count, pages, skipped = extract_pages(download_pdf(url))
+        row = classify_evidence(
+            url.rsplit("/", 1)[-1] or url, url, page_count, pages, *request["groups"],
+        )
+        row.update({
+            "extraction_status": "partial" if skipped else "completed",
+            "pages_with_text": len(pages),
+            "skipped_page_count": len(skipped),
+            "skipped_pages": "; ".join(str(item["page"]) for item in skipped),
+            "extraction_errors": "\n".join(
+                f"Trang {item['page']}: {item['reason']}" for item in skipped
+            ),
+        })
+    except Exception as exc:
+        row = {"error": f"{type(exc).__name__}: {exc}"}
+    Path(result_path).write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+
+
+def run_report(url: str, groups: list[list[str]], timeout_seconds: float = 120) -> dict:
+    with TemporaryDirectory(prefix="annual-report-") as folder:
+        request_path = Path(folder) / "request.json"
+        result_path = Path(folder) / "result.json"
+        request_path.write_text(
+            json.dumps({"url": url, "groups": groups}, ensure_ascii=False), encoding="utf-8",
+        )
+        try:
+            subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--analyze-report",
+                 str(request_path), str(result_path)],
+                timeout=timeout_seconds, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Quá {timeout_seconds:g} giây/file; đã dừng xử lý và chuyển file tiếp theo."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"Tiến trình đọc PDF dừng bất thường (mã {exc.returncode}); không chấm điểm."
+            ) from exc
+        row = json.loads(result_path.read_text(encoding="utf-8"))
+        if "error" in row:
+            raise ValueError(row["error"])
+        return row
+
+
 def main() -> None:
     st.set_page_config(page_title="ERP và Công nghệ Kế toán", layout="wide")
     st.title("Phân tích ERP và công nghệ trong kế toán")
@@ -407,21 +450,41 @@ def main() -> None:
             st.error("Cần ít nhất một link PDF.")
         else:
             rows = []
+            failures = []
             progress = st.progress(0)
+            current = st.empty()
             for index, raw_url in enumerate(urls, start=1):
+                current.info(f"Đang xử lý {index}/{len(urls)} — tối đa 120 giây/file: {raw_url}")
                 try:
-                    url = public_url(raw_url)
-                    page_count, pages, skipped = extract_pages(download_pdf(url))
-                    row = classify_evidence(
-                        url.rsplit("/", 1)[-1] or url, url, page_count, pages,
-                        erp_terms, tech_terms, context_terms, action_terms,
-                        operational_terms, planned_terms, negative_terms,
-                    )
+                    row = run_report(raw_url, groups)
                     rows.append(row)
-                    st.success(f"Đã phân tích: {row['document']}")
+                    if row["skipped_page_count"]:
+                        st.warning(
+                            f"{row['document']}: bỏ qua trang PDF {row['skipped_pages']}. "
+                            "Kết quả chấm mức áp dụng tạm thời, chỉ dựa trên phần đọc được."
+                        )
+                    else:
+                        st.success(f"Đã phân tích: {row['document']}")
                 except Exception as exc:
+                    failures.append({
+                        "url": raw_url,
+                        "status": "timeout" if isinstance(exc, TimeoutError) else "error",
+                        "error": str(exc),
+                    })
                     st.warning(f"Bỏ qua {raw_url}: {exc}")
                 progress.progress(index / len(urls))
+            current.empty()
+
+            if failures:
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=["url", "status", "error"])
+                writer.writeheader()
+                writer.writerows(failures)
+                st.download_button(
+                    "Tải danh sách file lỗi/quá thời gian",
+                    output.getvalue().encode("utf-8-sig"),
+                    "failed_reports.csv", "text/csv",
+                )
 
             if rows:
                 rank_rows(rows)
@@ -440,4 +503,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--analyze-report":
+        report_worker(sys.argv[2], sys.argv[3])
+    else:
+        main()
