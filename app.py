@@ -442,7 +442,6 @@ def rank_rows(rows: list[dict]) -> None:
     keys = sorted({(r["adoption_level"], r["adoption_points"]) for r in rows}, reverse=True)
     for row in rows:
         row["adoption_rank"] = keys.index((row["adoption_level"], row["adoption_points"])) + 1
-    rows.sort(key=lambda r: r["adoption_rank"])
 
 
 def report_worker(request_path: str, result_path: str) -> None:
