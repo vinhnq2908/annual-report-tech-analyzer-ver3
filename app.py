@@ -536,8 +536,9 @@ def main() -> None:
         elif not urls:
             st.error("Cần ít nhất một link PDF.")
         else:
-            rows = []
-            failures = []
+            # ponytail: session-only results; use durable storage for reload/restart recovery.
+            rows = st.session_state["analysis_rows"] = []
+            failures = st.session_state["analysis_failures"] = []
             progress = st.progress(0)
             current = st.empty()
             for index, raw_url in enumerate(urls, start=1):
@@ -567,31 +568,33 @@ def main() -> None:
                 progress.progress(index / len(urls))
             current.empty()
 
-            if failures:
-                output = io.StringIO()
-                writer = csv.DictWriter(output, fieldnames=["url", "status", "error"])
-                writer.writeheader()
-                writer.writerows(failures)
-                st.download_button(
-                    "Tải danh sách file lỗi/quá thời gian",
-                    output.getvalue().encode("utf-8-sig"),
-                    "failed_reports.csv", "text/csv",
-                )
+    rows = st.session_state.get("analysis_rows", [])
+    failures = st.session_state.get("analysis_failures", [])
+    if failures:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=["url", "status", "error"])
+        writer.writeheader()
+        writer.writerows(failures)
+        st.download_button(
+            "Tải danh sách file lỗi/quá thời gian",
+            output.getvalue().encode("utf-8-sig"),
+            "failed_reports.csv", "text/csv",
+        )
 
-            if rows:
-                rank_rows(rows)
-                st.subheader("Kết quả")
-                st.dataframe(rows, use_container_width=True)
-                output = io.StringIO()
-                writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-                writer.writeheader()
-                writer.writerows(rows)
-                st.download_button(
-                    "Tải kết quả CSV",
-                    output.getvalue().encode("utf-8-sig"),
-                    "erp_accounting_technology_analysis.csv",
-                    "text/csv",
-                )
+    if rows:
+        rank_rows(rows)
+        st.subheader("Kết quả lần phân tích gần nhất")
+        st.dataframe(rows, use_container_width=True)
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+        st.download_button(
+            "Tải kết quả CSV",
+            output.getvalue().encode("utf-8-sig"),
+            "erp_accounting_technology_analysis.csv",
+            "text/csv",
+        )
 
 
 if __name__ == "__main__":
