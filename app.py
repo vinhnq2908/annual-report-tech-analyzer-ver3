@@ -162,9 +162,9 @@ def download_pdf(url: str) -> bytes:
     request = Request(url, headers={"User-Agent": "AnnualReportTechAnalyzer/1.0"})
     with urlopen(request, timeout=30) as response:
         content_type = (response.headers.get("Content-Type") or "").lower()
-        data = response.read(30 * 1024 * 1024 + 1)
-    if len(data) > 30 * 1024 * 1024:
-        raise ValueError("PDF vượt giới hạn 30 MB")
+        data = response.read(150 * 1024 * 1024 + 1)
+    if len(data) > 150 * 1024 * 1024:
+        raise ValueError("PDF vượt giới hạn 150 MB")
     if "pdf" not in content_type and not data.startswith(b"%PDF"):
         raise ValueError("URL không trả về file PDF")
     return data
