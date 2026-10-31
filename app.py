@@ -85,6 +85,41 @@ hạ tầng mạng
 hạ tầng IT
 IT infrastructure
 hạ tầng thông tin"""),
+    "ai_data": ("Trí tuệ nhân tạo và dữ liệu", """trí tuệ nhân tạo
+artificial intelligence
+AI
+GenAI
+generative AI
+ChatGPT
+machine learning
+học máy
+deep learning
+học sâu
+big data
+dữ liệu lớn
+phân tích dữ liệu
+data analytics
+business intelligence
+kho dữ liệu
+data warehouse
+data lake
+chatbot
+trợ lý ảo"""),
+    "security": ("An ninh mạng và bảo mật", """an ninh mạng
+an toàn thông tin
+bảo mật thông tin
+bảo mật dữ liệu
+cybersecurity
+cyber security
+information security
+ISO 27001
+tường lửa
+firewall
+xác thực đa yếu tố
+multi-factor authentication
+bảo vệ dữ liệu cá nhân
+data protection
+phòng chống mã độc"""),
 }
 
 DEFAULT_ACTION_TERMS = """triển khai
@@ -532,10 +567,10 @@ def run_report(url: str, config: dict, timeout_seconds: float = REPORT_TIMEOUT_S
         return row
 
 def main() -> None:
-    st.set_page_config(page_title="Đám mây và chuyển đổi số trong BCTN", layout="wide")
-    st.title("Phân tích đám mây, hạ tầng, chuyển đổi số và CNTT trong báo cáo thường niên")
+    st.set_page_config(page_title="Công nghệ trong BCTN", layout="wide")
+    st.title("Phân tích công nghệ trong báo cáo thường niên")
     st.caption(
-        "Đếm từ khóa theo câu cho 2 nhóm: chuyển đổi số/công nghệ thông tin và đám mây/hạ tầng; "
+        "Đếm từ khóa theo câu cho 4 nhóm: chuyển đổi số/CNTT, đám mây/hạ tầng, AI/dữ liệu, an ninh mạng; "
         "chấm mức áp dụng 0-4, giữ số trang PDF và xuất CSV."
     )
     st.caption(
