@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
@@ -20,69 +21,71 @@ REPORT_TIMEOUT_SECONDS = 900
 OCR_DPI = 150
 MAX_OCR_PIXELS = 12_000_000
 
-DEFAULT_ERP_TERMS = """ERP
-hệ thống ERP
-phần mềm ERP
-enterprise resource planning
-SAP ERP
-SAP S/4HANA
-Oracle ERP
-Oracle Fusion
-Microsoft Dynamics
-Odoo
-NetSuite
-Infor ERP
-MISA
-FAST Accounting
-BRAVO"""
-
-DEFAULT_ACCOUNTING_TECH_TERMS = """phần mềm kế toán
-hệ thống kế toán
-hệ thống thông tin kế toán
-kế toán điện tử
-accounting software
-accounting information system
-cloud accounting
-hóa đơn điện tử
-electronic invoice
-e-invoice
-chữ ký số
-tự động hóa kế toán
-accounting automation
-RPA
-robotic process automation
-trí tuệ nhân tạo
-artificial intelligence
-machine learning
-OCR
-nhận dạng ký tự quang học
-phân tích dữ liệu
-data analytics
-business intelligence
-XBRL
-blockchain"""
-
-DEFAULT_ACCOUNTING_CONTEXT = """kế toán
-phòng kế toán
-bộ phận kế toán
-tài chính kế toán
-financial accounting
-finance and accounting
-báo cáo tài chính
-financial reporting
-sổ cái
-general ledger
-công nợ phải thu
-công nợ phải trả
-accounts receivable
-accounts payable
-đối soát
-thuế
-tax
-hóa đơn
-invoice
-kiểm toán
-audit"""
+# Nhóm công nghệ: (nhãn hiển thị, từ khóa mặc định). Từ VIẾT HOA toàn bộ (CNTT, AWS, API...) phải đúng chữ hoa
+# trong báo cáo để không khớp nhầm từ thường. Không dùng "hạ tầng" đứng một mình: nó khớp hạ tầng giao thông,
+# khu công nghiệp, bất động sản và làm nhiễu số đếm.
+TECH_GROUPS = {
+    "digital": ("Chuyển đổi số và công nghệ thông tin", """chuyển đổi số
+digital transformation
+số hóa
+digitalization
+digitalisation
+digitization
+công nghệ thông tin
+CNTT
+information technology
+hệ thống thông tin
+hệ thống CNTT
+nền tảng số
+digital platform
+mobile app
+phần mềm
+công nghệ 4.0
+cách mạng công nghiệp 4.0
+industry 4.0
+doanh nghiệp số
+văn phòng điện tử
+quy trình số
+kênh số
+dữ liệu số
+hệ sinh thái số
+chính phủ điện tử"""),
+    "cloud": ("Đám mây và hạ tầng", """điện toán đám mây
+cloud computing
+cloud
+đám mây
+hạ tầng đám mây
+private cloud
+public cloud
+hybrid cloud
+multi-cloud
+lưu trữ đám mây
+cloud storage
+SaaS
+PaaS
+IaaS
+AWS
+Azure
+Google Cloud
+trung tâm dữ liệu
+data center
+datacenter
+máy chủ
+server
+hosting
+ảo hóa
+virtualization
+hạ tầng công nghệ
+hạ tầng công nghệ thông tin
+hạ tầng CNTT
+cơ sở hạ tầng công nghệ
+cơ sở hạ tầng CNTT
+hạ tầng số
+hạ tầng mạng
+hạ tầng IT
+IT infrastructure
+hạ tầng thông tin"""),
+}
 
 DEFAULT_ACTION_TERMS = """triển khai
 đã triển khai
@@ -98,9 +101,14 @@ kết nối
 nâng cấp
 thay thế
 chuyển sang
+chuyển lên
+di chuyển lên
+mở rộng
 đầu tư
-tự động hóa
-số hóa
+ứng dụng
+xây dựng
+trang bị
+ra mắt
 implemented
 deployed
 adopted
@@ -110,10 +118,27 @@ go-live
 integrated
 upgraded
 automated
-digitized"""
+digitized
+applied
+launched
+developed
+migrated
+moved to
+expanded"""
 
 DEFAULT_OPERATIONAL_TERMS = """đã triển khai
 đã áp dụng
+đã ứng dụng
+đã xây dựng
+đã ra mắt
+đã nâng cấp
+đã chuyển lên
+đã chuyển sang
+đã di chuyển lên
+đã mở rộng
+đã đầu tư
+đã tích hợp
+đã hoàn thành chuyển đổi số
 đang sử dụng
 đưa vào sử dụng
 đang vận hành
@@ -123,6 +148,10 @@ in operation
 implemented
 deployed
 adopted
+launched
+migrated
+moved to
+upgraded
 used"""
 DEFAULT_PLANNED_TERMS = """dự kiến
 kế hoạch
@@ -145,10 +174,16 @@ not implemented
 not deployed
 not in use
 not adopted"""
-ACCOUNTING_SPECIFIC_MARKERS = (
-    "ke toan", "accounting", "hoa don", "invoice", "so cai", "general ledger",
-    "accounts payable", "accounts receivable", "xbrl", "thue", "tax",
-)
+
+
+def default_config() -> dict:
+    return {
+        "tech": {key: parse_terms(terms) for key, (_, terms) in TECH_GROUPS.items()},
+        "action": parse_terms(DEFAULT_ACTION_TERMS),
+        "operational": parse_terms(DEFAULT_OPERATIONAL_TERMS),
+        "planned": parse_terms(DEFAULT_PLANNED_TERMS),
+        "negative": parse_terms(DEFAULT_NEGATIVE_TERMS),
+    }
 
 
 def public_url(raw_url: str) -> str:
@@ -206,21 +241,27 @@ def parse_terms(raw: str) -> list[str]:
     return terms
 
 
+@lru_cache(maxsize=None)
 def term_pattern(term: str) -> re.Pattern:
     return re.compile(r"(?<!\w)" + re.escape(normalize_text(term)) + r"(?!\w)")
 
+def raw_case_ok(term: str, raw: str | None) -> bool:
+    # Từ viết hoa toàn bộ (AI, SAP...) phải đúng chữ hoa trong câu gốc; tránh khớp "ai", "sắp".
+    if raw is None or not (term.isascii() and term.isupper()):
+        return True
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", raw) is not None
 
-def find_matches(text: str, terms: list[str]) -> list[tuple[int, int, str]]:
+def find_matches(text: str, terms: list[str], raw: str | None = None) -> list[tuple[int, int, str]]:
     matches = []
     for term in terms:
-        matches.extend((m.start(), m.end(), term) for m in term_pattern(term).finditer(text))
+        if raw_case_ok(term, raw):
+            matches.extend((m.start(), m.end(), term) for m in term_pattern(term).finditer(text))
     chosen = []
     for start, end, term in sorted(matches, key=lambda item: (item[0], -(item[1] - item[0]))):
         if any(start < old_end and end > old_start for old_start, old_end, _ in chosen):
             continue
         chosen.append((start, end, term))
     return chosen
-
 
 def count_matches(text: str, terms: list[str]) -> int:
     return len(find_matches(text, terms))
@@ -331,45 +372,34 @@ LEVELS = {
 MIN_EVIDENCE = 3
 
 
-def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, context_terms,
-                      action_terms, operational_terms, planned_terms, negative_terms,
-                      min_evidence=MIN_EVIDENCE) -> dict:
-    raw_erp = raw_tech = relevant_erp = relevant_tech = context_hits = 0
+def classify_evidence(name, url, pages_count, pages, config, min_evidence=MIN_EVIDENCE) -> dict:
+    # ponytail: 3 sàng (có từ khóa -> có hành động/kế hoạch -> đã vận hành); đã bỏ sàng "ngữ cảnh kế toán".
+    # Câu nhắc công nghệ của đối tác hoặc sản phẩm bán ra vẫn được tính; đọc cột evidence để loại thủ công.
+    term_group = {}
+    for key, terms in config["tech"].items():
+        for term in terms:
+            term_group.setdefault(term, key)
+    all_terms = list(term_group)
+    freq = dict.fromkeys(config["tech"], 0)
     action_hits = operational_hits = planned_hits = negative_hits = word_count = 0
-    s1 = s2 = s3 = s4 = points = best_score = 0
-    relevant_terms, evidence, stuck = set(), [], []
+    s1 = s2 = s3 = points = best_score = 0
+    matched_terms, evidence, stuck = set(), [], []
     for page in pages:
         word_count += len(page["text"].split())
-        raw_erp += count_matches(page["normalized"], erp_terms)
-        raw_tech += count_matches(page["normalized"], tech_terms)
         for unit in re.split(r"(?<=[.!?。！？])\s+", page["text"]):
             unit = clean_pdf_text(unit)
             normalized = normalize_text(unit)
-            erp = find_matches(normalized, erp_terms)
-            tech = find_matches(normalized, tech_terms)
-            context = find_matches(normalized, context_terms)
-            if not erp and not tech:
+            found = find_matches(normalized, all_terms, unit)
+            if not found:
                 continue
             s1 += 1
-            is_erp_relevant = bool(erp and context)
-            is_tech_relevant = bool(tech and (context or any(
-                any(marker in normalize_text(term) for marker in ACCOUNTING_SPECIFIC_MARKERS)
-                for _, _, term in tech
-            )))
-            if not (is_erp_relevant or is_tech_relevant):
-                labels = "; ".join(term for _, _, term in erp + tech)
-                stuck.append(f"Kẹt sàng 2 (thiếu ngữ cảnh kế toán) | Trang {page['page']} | {labels} | {unit[:500]}")
-                continue
-            s2 += 1
-            relevant = (erp if is_erp_relevant else []) + (tech if is_tech_relevant else [])
-            relevant_terms.update(term for _, _, term in relevant)
-            relevant_erp += len(erp) if is_erp_relevant else 0
-            relevant_tech += len(tech) if is_tech_relevant else 0
-            context_hits += len(context)
-            actions = count_matches(normalized, action_terms)
-            operational = count_matches(normalized, operational_terms)
-            planned = count_matches(normalized, planned_terms)
-            negative = count_matches(normalized, negative_terms)
+            for _, _, term in found:
+                freq[term_group[term]] += 1
+                matched_terms.add(term)
+            actions = count_matches(normalized, config["action"])
+            operational = count_matches(normalized, config["operational"])
+            planned = count_matches(normalized, config["planned"])
+            negative = count_matches(normalized, config["negative"])
             action_hits += actions
             operational_hits += operational
             planned_hits += planned
@@ -384,25 +414,25 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
                 status, score = LEVELS[3], 3
             else:
                 status, score = LEVELS[1], 1
-            s3 += score >= 2
-            s4 += score == 4
+            s2 += score >= 2
+            s3 += score == 4
             points += score
             best_score = max(best_score, score)
-            labels = "; ".join(term for _, _, term in relevant)
-            evidence.append(f"Trang {page['page']} | {status} | {labels} | {unit[:700]}")
+            labels = "; ".join(term for _, _, term in found)
+            evidence.append((score, page["page"], f"Trang {page['page']} | {status} | {labels} | {unit[:700]}"))
             if score <= 1:
-                stuck.append(f"Kẹt sàng 3 ({status}) | Trang {page['page']} | {labels} | {unit[:500]}")
+                stuck.append(f"Kẹt sàng 2 ({status}) | Trang {page['page']} | {labels} | {unit[:500]}")
+
+    evidence.sort(key=lambda item: (-item[0], item[1]))  # mức cao nhất lên trước khi cắt 20 câu hiển thị
 
     if s1 == 0:
-        stuck_stage = "Sàng 1: không có từ khóa ERP/công nghệ"
+        stuck_stage = "Sàng 1: không có câu nào chứa từ khóa công nghệ"
     elif s2 == 0:
-        stuck_stage = "Sàng 2: có từ khóa nhưng không có ngữ cảnh kế toán"
+        stuck_stage = "Sàng 2: có từ khóa nhưng chỉ đề cập hoặc bị phủ định, chưa có hành động/kế hoạch"
     elif s3 == 0:
-        stuck_stage = "Sàng 3: có ngữ cảnh kế toán nhưng chưa có hành động/kế hoạch"
-    elif s4 == 0:
-        stuck_stage = "Sàng 4: có triển khai/kế hoạch nhưng chưa có bằng chứng đã vận hành"
+        stuck_stage = "Sàng 3: có triển khai/kế hoạch nhưng chưa có bằng chứng đã vận hành"
     else:
-        stuck_stage = "Qua đủ 4 sàng"
+        stuck_stage = "Qua đủ 3 sàng"
 
     if not evidence:
         evidence_status = "Không có bằng chứng"
@@ -417,23 +447,24 @@ def classify_evidence(name, url, pages_count, pages, erp_terms, tech_terms, cont
     if evidence_status == "Đủ bằng chứng":
         stuck_evidence = ""
 
+    total = sum(freq.values())
     return {
         "document": name, "url": url, "pages": pages_count, "word_count": word_count,
         "adoption_level": best_score, "adoption_level_name": LEVELS[best_score],
         "adoption_points": points,
         "evidence_status": evidence_status, "evidence_count": len(evidence),
         "stuck_stage": stuck_stage,
-        "stage1_keyword_sentences": s1, "stage2_accounting_sentences": s2,
-        "stage3_action_or_plan_sentences": s3, "stage4_operational_sentences": s4,
-        "erp_frequency": raw_erp, "erp_accounting_frequency": relevant_erp,
-        "accounting_tech_frequency": raw_tech,
-        "accounting_tech_relevant_frequency": relevant_tech,
-        "technology_frequency": relevant_erp + relevant_tech,
-        "technology_diversity": len(relevant_terms), "accounting_context_hits": context_hits,
+        "stage1_keyword_sentences": s1, "stage2_action_or_plan_sentences": s2,
+        "stage3_operational_sentences": s3,
+        "technology_frequency": total,
+        "technology_per_10k_words": round(total / word_count * 10000, 2) if word_count else 0,
+        "technology_diversity": len(matched_terms),
+        "technology_group_count": sum(value > 0 for value in freq.values()),
+        **{f"freq_{key}": value for key, value in freq.items()},
         "action_word_hits": action_hits, "operational_evidence_hits": operational_hits,
         "planned_evidence_hits": planned_hits, "negative_evidence_hits": negative_hits,
-        "relevant_terms": "; ".join(sorted(relevant_terms)),
-        "evidence": "\n".join(evidence[:20]),
+        "matched_terms": "; ".join(sorted(matched_terms)),
+        "evidence": "\n".join(item[2] for item in evidence[:20]),
         "stuck_evidence": stuck_evidence,
     }
 
@@ -452,7 +483,7 @@ def report_worker(request_path: str, result_path: str) -> None:
         skipped = [item for item in issues if not item["retained_text"]]
         ocr_pages = [str(page["page"]) for page in pages if page["method"] == "ocr"]
         row = classify_evidence(
-            url.rsplit("/", 1)[-1] or url, url, page_count, pages, *request["groups"],
+            url.rsplit("/", 1)[-1] or url, url, page_count, pages, request["config"],
         )
         row.update({
             "extraction_status": "partial" if issues else "completed",
@@ -472,13 +503,12 @@ def report_worker(request_path: str, result_path: str) -> None:
         row = {"error": f"{type(exc).__name__}: {exc}"}
     Path(result_path).write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
 
-
-def run_report(url: str, groups: list[list[str]], timeout_seconds: float = REPORT_TIMEOUT_SECONDS) -> dict:
+def run_report(url: str, config: dict, timeout_seconds: float = REPORT_TIMEOUT_SECONDS) -> dict:
     with TemporaryDirectory(prefix="annual-report-") as folder:
         request_path = Path(folder) / "request.json"
         result_path = Path(folder) / "result.json"
         request_path.write_text(
-            json.dumps({"url": url, "groups": groups}, ensure_ascii=False), encoding="utf-8",
+            json.dumps({"url": url, "config": config}, ensure_ascii=False), encoding="utf-8",
         )
         try:
             subprocess.run(
@@ -501,38 +531,45 @@ def run_report(url: str, groups: list[list[str]], timeout_seconds: float = REPOR
             raise ValueError(row["error"])
         return row
 
-
 def main() -> None:
-    st.set_page_config(page_title="ERP và Công nghệ Kế toán", layout="wide")
-    st.title("Phân tích ERP và công nghệ trong kế toán")
-    st.caption("Đếm từ khóa theo ngữ cảnh câu, chấm mức áp dụng, giữ số trang PDF và xuất CSV.")
+    st.set_page_config(page_title="Đám mây và chuyển đổi số trong BCTN", layout="wide")
+    st.title("Phân tích đám mây, hạ tầng, chuyển đổi số và CNTT trong báo cáo thường niên")
+    st.caption(
+        "Đếm từ khóa theo câu cho 2 nhóm: chuyển đổi số/công nghệ thông tin và đám mây/hạ tầng; "
+        "chấm mức áp dụng 0-4, giữ số trang PDF và xuất CSV."
+    )
     st.caption(
         f"Đọc text trước; OCR tiếng Việt/Anh khi trang có ít chữ hoặc lỗi ký tự. "
         f"Tối đa {REPORT_TIMEOUT_SECONDS} giây/file, gồm tải và phân tích; xử lý tuần tự."
     )
 
     with st.sidebar:
-        st.header("Bộ từ khóa")
-        erp_input = st.text_area("Từ khóa ERP", value=DEFAULT_ERP_TERMS, height=230)
-        tech_input = st.text_area("Công nghệ kế toán", value=DEFAULT_ACCOUNTING_TECH_TERMS, height=300)
-        context_input = st.text_area("Ngữ cảnh kế toán", value=DEFAULT_ACCOUNTING_CONTEXT, height=250)
+        st.header("Bộ từ khóa công nghệ")
+        tech_input = {
+            key: st.text_area(label, value=terms, height=170)
+            for key, (label, terms) in TECH_GROUPS.items()
+        }
+        st.header("Từ khóa chấm mức áp dụng")
         action_input = st.text_area("Từ hành động", value=DEFAULT_ACTION_TERMS, height=220)
         operational_input = st.text_area("Từ cho thấy đã vận hành", value=DEFAULT_OPERATIONAL_TERMS, height=170)
         planned_input = st.text_area("Từ cho thấy kế hoạch", value=DEFAULT_PLANNED_TERMS, height=170)
         negative_input = st.text_area("Cụm phủ định", value=DEFAULT_NEGATIVE_TERMS, height=170)
-        st.info("ERP/công nghệ chỉ tính liên quan kế toán khi cùng câu có ngữ cảnh kế toán. Câu phủ định không tính là đã áp dụng.")
+        st.info(
+            "Mọi câu có từ khóa công nghệ đều được tính, không cần ngữ cảnh kế toán. "
+            "Mức áp dụng chấm theo động từ trong câu; câu phủ định không tính là đã áp dụng."
+        )
 
     links = st.text_area("Link báo cáo PDF", placeholder="Mỗi dòng một URL PDF công khai", height=160)
 
     if st.button("Phân tích", type="primary"):
-        groups = [parse_terms(value) for value in (
-            erp_input, tech_input, context_input, action_input,
-            operational_input, planned_input, negative_input,
-        )]
-        erp_terms, tech_terms, context_terms, action_terms, operational_terms, planned_terms, negative_terms = groups
+        config = {
+            "tech": {key: parse_terms(value) for key, value in tech_input.items()},
+            "action": parse_terms(action_input), "operational": parse_terms(operational_input),
+            "planned": parse_terms(planned_input), "negative": parse_terms(negative_input),
+        }
         urls = [line.strip() for line in links.splitlines() if line.strip()]
-        if not erp_terms and not tech_terms:
-            st.error("Cần ít nhất một từ khóa ERP hoặc công nghệ kế toán.")
+        if not any(config["tech"].values()):
+            st.error("Cần ít nhất một từ khóa công nghệ.")
         elif not urls:
             st.error("Cần ít nhất một link PDF.")
         else:
@@ -547,7 +584,7 @@ def main() -> None:
                     f"tối đa {REPORT_TIMEOUT_SECONDS} giây/file: {raw_url}"
                 )
                 try:
-                    row = run_report(raw_url, groups)
+                    row = run_report(raw_url, config)
                     rows.append(row)
                     if row["extraction_status"] == "partial":
                         st.warning(
@@ -592,10 +629,9 @@ def main() -> None:
         st.download_button(
             "Tải kết quả CSV",
             output.getvalue().encode("utf-8-sig"),
-            "erp_accounting_technology_analysis.csv",
+            "technology_adoption_analysis.csv",
             "text/csv",
         )
-
 
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--analyze-report":
